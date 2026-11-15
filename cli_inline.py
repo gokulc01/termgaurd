@@ -22,16 +22,24 @@ def main():
 
     cwd = os.getcwd()
 
-    # Fast offline initialization: static gate + Ollama
+    # Fast offline initialization: static gate + HuggingFace LoRA[cite: 7]
     gate = StaticPolicyGate()
     retriever = DocumentationRetriever()
     sandbox = SandboxRunner(image="ubuntu:24.04")
 
+    # Updated configuration for fine-tuned LoRA model
+    # client_cfg = QwenClientConfig(
+    #     model_name_or_path="Qwen/Qwen2.5-Coder-3B-Instruct",
+    #     lora_adapter_path="termguard-qwen-lora",
+    #     backend="hf_outlines",
+    #     enable_guided_decoding=False,
+    # )
     client_cfg = QwenClientConfig(
-        model_name_or_path="qwen2.5-coder:7b-instruct",
+        model_name_or_path="qwen2.5-coder:3b-instruct",  # Vanilla baseline model
+        lora_adapter_path=None,
         backend="ollama",
         api_base_url="http://localhost:11434",
-        enable_guided_decoding=True,
+        enable_guided_decoding=True,  # Turned back ON to enforce JSON formatting
     )
     client = QwenStructuredClient(client_cfg)
 
@@ -44,8 +52,8 @@ def main():
     )
 
     try:
-        # Run stage 1 (generation) + stage 3 (static gate)
-        # Note: allowed_roots includes cwd so local tasks stay valid
+        # Run stage 1 (generation) + stage 3 (static gate)[cite: 7]
+        # Note: allowed_roots includes cwd so local tasks stay valid[cite: 7]
         result = orchestrator.run_episode(
             task_id="ZSH_INLINE",
             category=TaskCategory.BENIGN_ADMIN,
@@ -60,7 +68,7 @@ def main():
 
         action = last_turn.parsed_action
 
-        # If gate denied or requested clarification, do not insert anything
+        # If gate denied or requested clarification, do not insert anything[cite: 7]
         if result.final_status in ("DENIED", "ASKED"):
             sys.stderr.write(f"\n[TermGuard: {result.final_status}]\n")
             if last_turn.gate_verdict:
@@ -68,7 +76,7 @@ def main():
                     sys.stderr.write(f" - {r}\n")
             sys.exit(2)
 
-        # Print ONLY the shell-escaped executable command to stdout for Zsh BUFFER
+        # Print ONLY the shell-escaped executable command to stdout for Zsh BUFFER[cite: 7]
         if action.action_type == ActionType.EXECUTE:
             tokens = [action.utility] + action.args
             cmd_str = " ".join(shlex.quote(t) for t in tokens)

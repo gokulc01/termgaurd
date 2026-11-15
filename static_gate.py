@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import posixpath
 from typing import Dict, List, Set, Tuple
+import shlex
 import tree_sitter_bash as tsbash
 from tree_sitter import Language, Parser, Node
 
@@ -10,24 +11,22 @@ from schemas import DecisionClass, GateVerdict, StructuredAction
 
 BASH_LANGUAGE = Language(tsbash.language())
 
-# Forbidden AST node types that violate fail-closed static decidability
 FORBIDDEN_AST_NODES: Set[str] = {
     "ERROR",
     "MISSING",
-    "command_substitution",  # $(...) or `...`
-    "process_substitution",  # <(...) or >(...)
-    "function_definition",  # foo() { ... }
-    "subshell",  # (...)
+    "command_substitution",
+    "process_substitution",
+    "function_definition",
+    "subshell",
     "c_style_for_statement",
     "for_statement",
     "while_statement",
     "herestring_redirect",
-    "expansion",  # ${VAR:-...}
-    "simple_expansion",  # $VAR
-    "arithmetic_expansion",  # $((1+1))
+    "expansion",
+    "simple_expansion",
+    "arithmetic_expansion",
 }
 
-# Utilities unconditionally prohibited (privilege escalation, raw disk, nested shells, network/eval)
 PROHIBITED_UTILITIES: Set[str] = {
     "sudo",
     "su",
@@ -68,7 +67,6 @@ PROHIBITED_UTILITIES: Set[str] = {
     "killall",
 }
 
-# Read-only diagnostic utilities eligible for Allow inside authorized roots
 READ_ONLY_UTILITIES: Set[str] = {
     "ls",
     "stat",
@@ -103,9 +101,10 @@ READ_ONLY_UTILITIES: Set[str] = {
     "md5sum",
     "sha256sum",
     "journalctl",
+    "cd",
+    "echo",
 }
 
-# Bounded mutation utilities allowed ONLY inside authorized task roots with safe flags
 BOUNDED_MUTATION_UTILITIES: Set[str] = {
     "mkdir",
     "touch",
@@ -141,10 +140,6 @@ class StaticPolicyGate:
         working_dir: str,
         symlink_map: Dict[str, str],
     ) -> str:
-        """
-        Normalizes `raw_path` relative to `working_dir` and resolves known container
-        symlinks iteratively (detecting symlink loops) to prevent traversal escapes.
-        """
         if not raw_path.startswith("/"):
             candidate = posixpath.normpath(posixpath.join(working_dir, raw_path))
         else:
@@ -163,7 +158,6 @@ class StaticPolicyGate:
             else:
                 candidate = posixpath.normpath(target)
 
-        # Check prefix components for directory symlinks
         parts = candidate.strip("/").split("/")
         accum = ""
         for idx, part in enumerate(parts):
@@ -193,11 +187,11 @@ class StaticPolicyGate:
         reasons: List[str] = []
         normalized_paths: List[str] = []
 
-        # 1. Verify working directory is inside allowed roots
         norm_wd = self._resolve_path_symlink_aware(
             action.working_dir_id, "/workspace", symlink_map
         )
         normalized_paths.append(norm_wd)
+
         if not self._is_within_allowed_roots(norm_wd, allowed_roots):
             return GateVerdict(
                 static_decision=DecisionClass.DENY,
@@ -209,202 +203,211 @@ class StaticPolicyGate:
                 normalized_paths=normalized_paths,
             )
 
-        # 2. Parse full reconstructed command via tree-sitter-bash
-        cmd_str = action.to_command_preview()
-        tree = self.parser.parse(cmd_str.encode("utf-8"))
-        root_node = tree.root_node
-
-        if root_node.has_error:
-            return GateVerdict(
-                static_decision=DecisionClass.DENY,
-                semantic_decision=action.semantic_risk,
-                final_decision=DecisionClass.DENY,
-                reasons=["tree-sitter-bash detected syntax or parse error node."],
-                normalized_paths=normalized_paths,
-            )
-
-        all_nodes = self._walk_ast(root_node)
-        for node in all_nodes:
-            if node.is_missing or node.type in FORBIDDEN_AST_NODES:
-                return GateVerdict(
-                    static_decision=DecisionClass.DENY,
-                    semantic_decision=action.semantic_risk,
-                    final_decision=DecisionClass.DENY,
-                    reasons=[
-                        f"Forbidden or undecidable AST node encountered: '{node.type}'."
-                    ],
-                    normalized_paths=normalized_paths,
-                )
-            # Analyze compound commands (pipeline, list) holistically; reject embedded operators in single action
-            if node.type in (
-                "pipeline",
-                "list",
-                "redirected_statement",
-                "file_redirect",
-            ):
-                return GateVerdict(
-                    static_decision=DecisionClass.DENY,
-                    semantic_decision=action.semantic_risk,
-                    final_decision=DecisionClass.DENY,
-                    reasons=[
-                        f"Compound construct or shell redirection '{node.type}' rejected in atomic action."
-                    ],
-                    normalized_paths=normalized_paths,
-                )
-
-        # 3. Check raw argument tokens for obfuscation, dynamic evaluation, or embedded shell syntax
         forbidden_tokens = {"|", "||", "&&", ";", "&", ">", ">>", "<", "<<", ">>>"}
-        for arg in action.args:
-            if arg in forbidden_tokens or any(
-                sub in arg
-                for sub in (
-                    "$(",
-                    "`",
-                    "${",
-                    "base64",
-                    "/dev/tcp",
-                    "/dev/sd",
-                    "/dev/nvme",
-                    "/proc/",
-                    "/sys/",
+
+        # Validate each command in the sequence independently
+        for cmd in action.commands:
+            tokens = [cmd.utility] + [str(a) for a in cmd.args]
+            cmd_str = " ".join(shlex.quote(t) for t in tokens)
+
+            tree = self.parser.parse(cmd_str.encode("utf-8"))
+            if tree.root_node.has_error:
+                return GateVerdict(
+                    static_decision=DecisionClass.DENY,
+                    semantic_decision=action.semantic_risk,
+                    final_decision=DecisionClass.DENY,
+                    reasons=["tree-sitter-bash detected syntax or parse error node."],
+                    normalized_paths=normalized_paths,
                 )
+
+            all_nodes = self._walk_ast(tree.root_node)
+            for node in all_nodes:
+                if node.is_missing or node.type in FORBIDDEN_AST_NODES:
+                    return GateVerdict(
+                        static_decision=DecisionClass.DENY,
+                        semantic_decision=action.semantic_risk,
+                        final_decision=DecisionClass.DENY,
+                        reasons=[
+                            f"Forbidden or undecidable AST node encountered: '{node.type}'."
+                        ],
+                        normalized_paths=normalized_paths,
+                    )
+                if node.type in (
+                    "pipeline",
+                    "list",
+                    "redirected_statement",
+                    "file_redirect",
+                ):
+                    return GateVerdict(
+                        static_decision=DecisionClass.DENY,
+                        semantic_decision=action.semantic_risk,
+                        final_decision=DecisionClass.DENY,
+                        reasons=[
+                            f"Compound construct '{node.type}' rejected within atomic command."
+                        ],
+                        normalized_paths=normalized_paths,
+                    )
+
+            for arg in cmd.args:
+                if arg in forbidden_tokens or any(
+                    sub in arg
+                    for sub in (
+                        "$(",
+                        "`",
+                        "${",
+                        "base64",
+                        "/dev/tcp",
+                        "/dev/sd",
+                        "/dev/nvme",
+                        "/proc/",
+                        "/sys/",
+                    )
+                ):
+                    return GateVerdict(
+                        static_decision=DecisionClass.DENY,
+                        semantic_decision=action.semantic_risk,
+                        final_decision=DecisionClass.DENY,
+                        reasons=[
+                            f"Argument '{arg}' contains prohibited compound shell operator or token."
+                        ],
+                        normalized_paths=normalized_paths,
+                    )
+
+            util = os.path.basename(cmd.utility)
+            if util in PROHIBITED_UTILITIES:
+                return GateVerdict(
+                    static_decision=DecisionClass.DENY,
+                    semantic_decision=action.semantic_risk,
+                    final_decision=DecisionClass.DENY,
+                    reasons=[f"Utility '{util}' is prohibited."],
+                    normalized_paths=normalized_paths,
+                )
+
+            if (
+                util not in READ_ONLY_UTILITIES
+                and util not in BOUNDED_MUTATION_UTILITIES
+            ):
+                return GateVerdict(
+                    static_decision=DecisionClass.DENY,
+                    semantic_decision=action.semantic_risk,
+                    final_decision=DecisionClass.DENY,
+                    reasons=[f"Unsupported utility '{util}' (fail-closed policy)."],
+                    normalized_paths=normalized_paths,
+                )
+
+            if util == "find":
+                for forbidden_flag in (
+                    "-exec",
+                    "-execdir",
+                    "-ok",
+                    "-okdir",
+                    "-fprint",
+                    "-fls",
+                ):
+                    if forbidden_flag in cmd.args:
+                        return GateVerdict(
+                            static_decision=DecisionClass.DENY,
+                            semantic_decision=action.semantic_risk,
+                            final_decision=DecisionClass.DENY,
+                            reasons=[
+                                f"'find' flag '{forbidden_flag}' permits arbitrary command execution."
+                            ],
+                            normalized_paths=normalized_paths,
+                        )
+                if "-delete" in cmd.args:
+                    return GateVerdict(
+                        static_decision=DecisionClass.ASK,
+                        semantic_decision=action.semantic_risk,
+                        final_decision=DecisionClass.ASK,
+                        reasons=[
+                            "'find -delete' mutates filesystem; requires explicit user confirmation."
+                        ],
+                        normalized_paths=normalized_paths,
+                    )
+
+            if util == "tar" and any(
+                f in cmd.args for f in ("-P", "--absolute-names", "--to-command")
             ):
                 return GateVerdict(
                     static_decision=DecisionClass.DENY,
                     semantic_decision=action.semantic_risk,
                     final_decision=DecisionClass.DENY,
                     reasons=[
-                        f"Argument '{arg}' contains prohibited compound shell operator or dynamic/device/system token."
+                        "'tar' absolute paths or --to-command execution prohibited."
                     ],
                     normalized_paths=normalized_paths,
                 )
-        # 4. Utility-level allowlist & rule inspection
-        util = os.path.basename(action.utility)
-        if util in PROHIBITED_UTILITIES:
-            return GateVerdict(
-                static_decision=DecisionClass.DENY,
-                semantic_decision=action.semantic_risk,
-                final_decision=DecisionClass.DENY,
-                reasons=[f"Utility '{util}' is in the prohibited utility set."],
-                normalized_paths=normalized_paths,
-            )
 
-        if util not in READ_ONLY_UTILITIES and util not in BOUNDED_MUTATION_UTILITIES:
-            return GateVerdict(
-                static_decision=DecisionClass.DENY,
-                semantic_decision=action.semantic_risk,
-                final_decision=DecisionClass.DENY,
-                reasons=[f"Unsupported utility '{util}' (fail-closed policy)."],
-                normalized_paths=normalized_paths,
-            )
-
-        # 5. Utility-specific flag hazards (e.g., find -exec / -delete, sed -i outside root, tar -P, chmod 777)
-        if util == "find":
-            for forbidden_flag in (
-                "-exec",
-                "-execdir",
-                "-ok",
-                "-okdir",
-                "-fprint",
-                "-fls",
+            if util == "chmod" and any(
+                mode in cmd.args for mode in ("777", "a+rwx", "+s", "u+s", "4755")
             ):
-                if forbidden_flag in action.args:
-                    return GateVerdict(
-                        static_decision=DecisionClass.DENY,
-                        semantic_decision=action.semantic_risk,
-                        final_decision=DecisionClass.DENY,
-                        reasons=[
-                            f"'find' flag '{forbidden_flag}' permits arbitrary command execution or file clobbering."
-                        ],
-                        normalized_paths=normalized_paths,
-                    )
-            if "-delete" in action.args:
                 return GateVerdict(
-                    static_decision=DecisionClass.ASK,
+                    static_decision=DecisionClass.DENY,
                     semantic_decision=action.semantic_risk,
-                    final_decision=DecisionClass.ASK,
+                    final_decision=DecisionClass.DENY,
                     reasons=[
-                        "'find -delete' mutates filesystem; requires explicit user confirmation."
+                        "Insecure permission mode (world-writable or SUID bit) prohibited."
                     ],
                     normalized_paths=normalized_paths,
                 )
 
-        if util == "tar" and any(
-            f in action.args for f in ("-P", "--absolute-names", "--to-command")
-        ):
-            return GateVerdict(
-                static_decision=DecisionClass.DENY,
-                semantic_decision=action.semantic_risk,
-                final_decision=DecisionClass.DENY,
-                reasons=["'tar' absolute paths or --to-command execution prohibited."],
-                normalized_paths=normalized_paths,
-            )
-
-        if util == "chmod" and any(
-            mode in action.args for mode in ("777", "a+rwx", "+s", "u+s", "4755")
-        ):
-            return GateVerdict(
-                static_decision=DecisionClass.DENY,
-                semantic_decision=action.semantic_risk,
-                final_decision=DecisionClass.DENY,
-                reasons=[
-                    "Insecure permission mode (world-writable or SUID bit) prohibited."
-                ],
-                normalized_paths=normalized_paths,
-            )
-
-        # 6. Path argument normalization & boundary enforcement
-        for arg in action.args:
-            if arg.startswith("-"):
-                continue
-            # Treat path-like arguments or arguments to filesystem utilities as candidate paths
-            if "/" in arg or arg in (".", "..") or util in BOUNDED_MUTATION_UTILITIES:
-                resolved = self._resolve_path_symlink_aware(arg, norm_wd, symlink_map)
-                normalized_paths.append(resolved)
-                if not self._is_within_allowed_roots(resolved, allowed_roots):
-                    return GateVerdict(
-                        static_decision=DecisionClass.DENY,
-                        semantic_decision=action.semantic_risk,
-                        final_decision=DecisionClass.DENY,
-                        reasons=[
-                            f"Normalized path '{resolved}' (from '{arg}') resolves outside allowed roots {allowed_roots}."
-                        ],
-                        normalized_paths=normalized_paths,
+            for arg in cmd.args:
+                if arg.startswith("-"):
+                    continue
+                if (
+                    "/" in arg
+                    or arg in (".", "..")
+                    or util in BOUNDED_MUTATION_UTILITIES
+                ):
+                    resolved = self._resolve_path_symlink_aware(
+                        arg, norm_wd, symlink_map
                     )
+                    normalized_paths.append(resolved)
+                    if not self._is_within_allowed_roots(resolved, allowed_roots):
+                        return GateVerdict(
+                            static_decision=DecisionClass.DENY,
+                            semantic_decision=action.semantic_risk,
+                            final_decision=DecisionClass.DENY,
+                            reasons=[
+                                f"Normalized path '{resolved}' resolves outside allowed roots {allowed_roots}."
+                            ],
+                            normalized_paths=normalized_paths,
+                        )
 
-        # 7. Destructive scope checks for `rm`
-        if util == "rm":
-            has_recursive = any(
-                a in ("-r", "-R", "-rf", "-fr", "--recursive") for a in action.args
-            )
-            has_wildcard = any("*" in a or "?" in a for a in action.args)
-            for p in normalized_paths[1:]:
-                if p in [posixpath.normpath(r) for r in allowed_roots] or p == "/":
-                    return GateVerdict(
-                        static_decision=DecisionClass.DENY,
-                        semantic_decision=action.semantic_risk,
-                        final_decision=DecisionClass.DENY,
-                        reasons=[
-                            f"Attempted deletion of task root or system root '{p}'."
-                        ],
-                        normalized_paths=normalized_paths,
-                    )
-            if has_recursive or has_wildcard:
-                return GateVerdict(
-                    static_decision=DecisionClass.ASK,
-                    semantic_decision=action.semantic_risk,
-                    final_decision=DecisionClass.ASK,
-                    reasons=[
-                        "Recursive or wildcard removal requires user confirmation (Ask)."
-                    ],
-                    normalized_paths=normalized_paths,
+            if util == "rm":
+                has_recursive = any(
+                    a in ("-r", "-R", "-rf", "-fr", "--recursive") for a in cmd.args
                 )
+                has_wildcard = any("*" in a or "?" in a for a in cmd.args)
+                for p in normalized_paths:
+                    if p in [posixpath.normpath(r) for r in allowed_roots] or p == "/":
+                        return GateVerdict(
+                            static_decision=DecisionClass.DENY,
+                            semantic_decision=action.semantic_risk,
+                            final_decision=DecisionClass.DENY,
+                            reasons=[
+                                f"Attempted deletion of task root or system root '{p}'."
+                            ],
+                            normalized_paths=normalized_paths,
+                        )
+                if has_recursive or has_wildcard:
+                    return GateVerdict(
+                        static_decision=DecisionClass.ASK,
+                        semantic_decision=action.semantic_risk,
+                        final_decision=DecisionClass.ASK,
+                        reasons=[
+                            "Recursive or wildcard removal requires user confirmation (Ask)."
+                        ],
+                        normalized_paths=normalized_paths,
+                    )
 
-        reasons.append(f"Static AST and path verification passed for utility '{util}'.")
+        reasons.append(
+            "Static AST and path verification passed for all commands in sequence."
+        )
         return GateVerdict(
             static_decision=DecisionClass.ALLOW,
             semantic_decision=action.semantic_risk,
             final_decision=DecisionClass.ALLOW,
             reasons=reasons,
-            normalized_paths=normalized_paths,
+            normalized_paths=list(set(normalized_paths)),
         )

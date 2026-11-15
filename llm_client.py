@@ -55,7 +55,7 @@ class QwenStructuredClient:
         self._vllm_tokenizer = None
         self._hf_model = None
         self._hf_tokenizer = None
-        self._outlines_generator = None
+        self._outlines_model = None
 
         self._initialize_backend()
 
@@ -114,7 +114,7 @@ class QwenStructuredClient:
         base_model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name_or_path,
             quantization_config=bnb_config,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
             trust_remote_code=True,
         )
@@ -132,12 +132,9 @@ class QwenStructuredClient:
         if self.config.enable_guided_decoding:
             import outlines
 
-            outlines_model = outlines.models.Transformers(
+            # New Outlines v1 API initialization
+            self._outlines_model = outlines.from_transformers(
                 self._hf_model, self._hf_tokenizer
-            )
-            self._outlines_generator = outlines.generate.json(
-                outlines_model,
-                StructuredAction,
             )
 
     def _format_chat_prompt(self, user_prompt: str) -> str:
@@ -172,6 +169,39 @@ class QwenStructuredClient:
             return self._generate_hf_outlines(prompt)
         raise RuntimeError(f"Invalid backend state: {self.config.backend}")
 
+    def _generate_hf_outlines(self, prompt: str) -> str:
+        formatted_prompt = self._format_chat_prompt(prompt)
+
+        if self.config.enable_guided_decoding and self._outlines_model is not None:
+            # Outlines v1 API returns the JSON string directly when a Pydantic class is passed
+            result = self._outlines_model(formatted_prompt, StructuredAction)
+            return result
+
+        else:
+            # Fallback to standard HuggingFace generation if guided decoding is off
+            import torch
+
+            inputs = self._hf_tokenizer(formatted_prompt, return_tensors="pt").to(
+                self._hf_model.device
+            )
+
+            with torch.no_grad():
+                outputs = self._hf_model.generate(
+                    **inputs,
+                    max_new_tokens=self.config.max_new_tokens,
+                    temperature=self.config.temperature
+                    if self.config.temperature > 0
+                    else 1e-5,
+                    top_p=self.config.top_p,
+                    do_sample=self.config.temperature > 0,
+                    pad_token_id=self._hf_tokenizer.eos_token_id,
+                )
+
+            response = self._hf_tokenizer.decode(
+                outputs[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+            )
+            return response.strip()
+
     def _generate_ollama(self, prompt: str) -> str:
         url = f"{self.config.api_base_url.rstrip('/')}/api/chat"
 
@@ -188,7 +218,6 @@ class QwenStructuredClient:
             "stream": False,
         }
 
-        # FIX: Use standard JSON mode instead of strict schema matching
         if self.config.enable_guided_decoding:
             payload["format"] = "json"
 

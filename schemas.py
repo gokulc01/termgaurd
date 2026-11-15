@@ -2,6 +2,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_validator
+import shlex
 
 
 class ActionType(str, Enum):
@@ -16,13 +17,33 @@ class DecisionClass(str, Enum):
 
 
 class TaskCategory(str, Enum):
-    DIAGNOSTICS_LOGS = "diagnostics_logs"  # 18 tasks
-    BENIGN_ADMIN = "benign_administration"  # 12 tasks
-    CATASTROPHIC_SCOPE = "catastrophic_scope"  # 6 tasks
-    OBFUSCATED_DYNAMIC = "obfuscated_dynamic"  # 6 tasks
-    PRIVILEGE_PROBES = "privilege_probes"  # 6 tasks
-    AMBIGUOUS_INTENT = "ambiguous_intent"  # 6 tasks
-    RESOURCE_EXHAUSTION = "resource_exhaustion"  # 6 tasks
+    DIAGNOSTICS_LOGS = "diagnostics_logs"
+    BENIGN_ADMIN = "benign_administration"
+    CATASTROPHIC_SCOPE = "catastrophic_scope"
+    OBFUSCATED_DYNAMIC = "obfuscated_dynamic"
+    PRIVILEGE_PROBES = "privilege_probes"
+    AMBIGUOUS_INTENT = "ambiguous_intent"
+    RESOURCE_EXHAUSTION = "resource_exhaustion"
+
+
+class CommandNode(BaseModel):
+    utility: str = Field(
+        description="Primary Linux executable name (e.g., 'find', 'grep', 'mkdir', 'cd')."
+    )
+    args: List[str] = Field(
+        default_factory=list,
+        description="Command arguments as discrete array tokens, never interpolated shell strings.",
+    )
+
+    @field_validator("utility")
+    @classmethod
+    def validate_utility_token(cls, v: str) -> str:
+        v = v.strip()
+        if not v or any(ch in v for ch in (" ", ";", "|", "&", "$", "`", ">", "<")):
+            raise ValueError(
+                "Utility must be a single binary token without shell metacharacters."
+            )
+        return v
 
 
 class StructuredAction(BaseModel):
@@ -31,12 +52,8 @@ class StructuredAction(BaseModel):
     action_type: ActionType = Field(
         description="EXECUTE to run a command, or ASK if target/mutation scope is ambiguous."
     )
-    utility: str = Field(
-        description="Primary Linux executable name (e.g., 'find', 'grep', 'df') or 'ask_user'."
-    )
-    args: List[str] = Field(
-        default_factory=list,
-        description="Command arguments as discrete array tokens, never interpolated shell strings.",
+    commands: List[CommandNode] = Field(
+        description="Ordered list of commands to execute sequentially.", min_length=1
     )
     working_dir_id: str = Field(
         default="/workspace",
@@ -57,22 +74,13 @@ class StructuredAction(BaseModel):
         description="Required when action_type == ASK or semantic_risk == Ask.",
     )
 
-    @field_validator("utility")
-    @classmethod
-    def validate_utility_token(cls, v: str) -> str:
-        v = v.strip()
-        if not v or any(ch in v for ch in (" ", ";", "|", "&", "$", "`", ">", "<")):
-            raise ValueError(
-                "Utility must be a single binary token without shell metacharacters."
-            )
-        return v
-
     def to_command_preview(self) -> str:
         """Reconstructs a shell-escaped preview string for static AST inspection."""
-        import shlex
-
-        tokens = [self.utility] + [str(a) for a in self.args]
-        return " ".join(shlex.quote(t) for t in tokens)
+        lines = []
+        for cmd in self.commands:
+            tokens = [cmd.utility] + [str(a) for a in cmd.args]
+            lines.append(" ".join(shlex.quote(t) for t in tokens))
+        return " && ".join(lines)
 
 
 class RetrievalLog(BaseModel):
@@ -114,9 +122,7 @@ class EpisodeResult(BaseModel):
     config_id: str
     category: TaskCategory
     turns: List[TurnTelemetry]
-    final_status: (
-        str  # "COMPLETED", "ASKED", "DENIED", "FAILED_RECOVERY", "INVALID_TOOL_CALL"
-    )
+    final_status: str
     unsafe_executed: bool = False
     post_condition_passed: bool = False
     recovered_after_failure: bool = False
