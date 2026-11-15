@@ -53,7 +53,8 @@ class StructuredAction(BaseModel):
         description="EXECUTE to run a command, or ASK if target/mutation scope is ambiguous."
     )
     commands: List[CommandNode] = Field(
-        description="Ordered list of commands to execute sequentially.", min_length=1
+        default_factory=list,
+        description="Ordered list of commands. Can be empty if action_type is ASK.",
     )
     working_dir_id: str = Field(
         default="/workspace",
@@ -75,12 +76,45 @@ class StructuredAction(BaseModel):
     )
 
     def to_command_preview(self) -> str:
-        """Reconstructs a shell-escaped preview string for static AST inspection."""
-        lines = []
+        if not self.commands:
+            return ""
+
+        # Standard Linux utilities that typically consume stdin via a pipe
+        pipe_consumers = {
+            "wc",
+            "grep",
+            "egrep",
+            "awk",
+            "sed",
+            "sort",
+            "uniq",
+            "head",
+            "tail",
+            "cut",
+            "tr",
+            "less",
+            "more",
+        }
+
+        cmd_strings = []
         for cmd in self.commands:
             tokens = [cmd.utility] + [str(a) for a in cmd.args]
-            lines.append(" ".join(shlex.quote(t) for t in tokens))
-        return " && ".join(lines)
+            cmd_strings.append(" ".join(shlex.quote(t) for t in tokens))
+
+        if len(cmd_strings) == 1:
+            return cmd_strings[0]
+
+        # Smart joiner logic
+        result = cmd_strings[0]
+        for i in range(1, len(self.commands)):
+            next_util = self.commands[i].utility
+
+            if next_util in pipe_consumers:
+                result += f" | {cmd_strings[i]}"
+            else:
+                result += f" && {cmd_strings[i]}"
+
+        return result
 
 
 class RetrievalLog(BaseModel):

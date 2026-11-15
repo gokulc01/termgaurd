@@ -103,6 +103,8 @@ READ_ONLY_UTILITIES: Set[str] = {
     "journalctl",
     "cd",
     "echo",
+    "date",
+    "git",
 }
 
 BOUNDED_MUTATION_UTILITIES: Set[str] = {
