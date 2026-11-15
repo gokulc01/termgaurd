@@ -1,57 +1,120 @@
 #!/usr/bin/env python3
 # run_benchmark.py
-import sys
-import os
 import argparse
+import hashlib
+import os
+import platform
+from datetime import datetime, timezone
 from pathlib import Path
 
-# Force HuggingFace offline for fast benchmarking
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# Force HuggingFace offline for fast, reproducible benchmarking
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-from llm_client import QwenClientConfig, QwenStructuredClient
-from evaluate_benchmark import run_ablation_matrix
-from hybrid_retriever import HybridDocRetriever
+from evaluate_benchmark import ALL_CONFIGS, run_ablation_matrix  # noqa: E402
+from llm_client import QwenClientConfig, QwenStructuredClient  # noqa: E402
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TermGuard-Agent Benchmark Runner")
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="ft_3.5b_simple_prompt_results.json",
-        help="Path to save the JSON results",
+    ap = argparse.ArgumentParser(description="TermGuard-Agent Benchmark Runner")
+    ap.add_argument(
+        "--model",
+        required=True,
+        help="e.g. qwen2.5-coder:3b-instruct or termguard-qwen-2.5-3B-coder-ft",
     )
-    args = parser.parse_args()
+    ap.add_argument(
+        "--backend",
+        default="ollama",
+        choices=["ollama", "vllm_api", "vllm_offline", "hf_outlines"],
+    )
+    ap.add_argument("--api-base", default="http://localhost:11434")
+    ap.add_argument("--lora", default=None)
+    ap.add_argument("--tasks", default="benchmarks/tasks_schema.json")
+    ap.add_argument(
+        "--corpus",
+        default=None,
+        help="tldr_corpus.json (default: $TERMGUARD_CORPUS, then next to the code)",
+    )
+    ap.add_argument(
+        "--prompt-style",
+        choices=["simple", "detailed", "legacy"],
+        default="simple",
+        help="use the SAME style the fine-tuned model was trained with",
+    )
+    ap.add_argument(
+        "--configs", nargs="+", default=list(ALL_CONFIGS), choices=list(ALL_CONFIGS)
+    )
+    ap.add_argument(
+        "--rag-supported-only",
+        action="store_true",
+        help="index only utilities the static gate supports",
+    )
+    ap.add_argument(
+        "--action-format",
+        choices=["commands", "legacy"],
+        default="commands",
+        help="legacy = single utility/args (the format the QLoRA model was trained on)",
+    )
+    ap.add_argument(
+        "--strip-duplicated-utility",
+        action="store_true",
+        help="drop args[0] when it repeats the utility name (counted in results)",
+    )
+    ap.add_argument(
+        "--no-guided", action="store_true", help="disable schema-constrained decoding"
+    )
+    ap.add_argument("--output", required=True, help="path to save the JSON results")
+    args = ap.parse_args()
 
-    # Configuration targeting vanilla 3B baseline via Ollama
     client_cfg = QwenClientConfig(
-        # model_name_or_path="qwen2.5-coder:3b-instruct",
-        model_name_or_path="termguard-qwen-2.5-3B-coder-ft",
-        lora_adapter_path=None,
-        backend="ollama",
-        api_base_url="http://localhost:11434",
-        enable_guided_decoding=True,
+        model_name_or_path=args.model,
+        lora_adapter_path=args.lora,
+        backend=args.backend,
+        api_base_url=args.api_base,
+        enable_guided_decoding=not args.no_guided,
+        action_format=args.action_format,
     )
     client = QwenStructuredClient(client_cfg)
 
-    print("Loading Hybrid Retriever and semantic index...")
-    corpus_path = os.path.expanduser(
-        "~/Documents/iiith/sem3/lma/grp_prj/termgaurd_agent/tldr_corpus.json"
-    )
-    retriever = HybridDocRetriever(corpus_path)
+    retriever = None
+    if any(c in ("C1", "C2") for c in args.configs):
+        from hybrid_retriever import HybridDocRetriever
 
-    print(f"Starting C0-C3 benchmark execution over 60 tasks...")
+        print("Loading hybrid retriever and semantic index...")
+        retriever = HybridDocRetriever(
+            args.corpus, supported_only=args.rag_supported_only
+        )
+
+    tasks_path = Path(args.tasks)
+    manifest = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "client": client.describe(),
+        "tasks_file": str(tasks_path),
+        "tasks_sha256": sha256_file(tasks_path),
+        "corpus_sha": getattr(retriever, "corpus_sha", None),
+        "rag_supported_only": args.rag_supported_only,
+        "configs": args.configs,
+        "python": platform.python_version(),
+    }
+
     print(
-        f"Target Model: {client_cfg.model_name_or_path} (Backend: {client_cfg.backend})"
+        f"Running {args.configs} | model={args.model} ({args.backend}) | prompt={args.prompt_style}"
     )
-    print(f"Results will be saved to: {args.output}")
+    print(f"Results -> {args.output}")
 
     summary = run_ablation_matrix(
-        tasks_path=Path("benchmarks/tasks_schema.json"),
+        tasks_path=tasks_path,
         llm_generate_fn=client.generate,
         retriever=retriever,
         output_report_path=Path(args.output),
+        prompt_style=args.prompt_style,
+        configs_to_run=args.configs,
+        manifest=manifest,
+        strip_duplicated_utility=args.strip_duplicated_utility,
     )
 
     print("\n================ BENCHMARK SUMMARY ================")
@@ -59,6 +122,7 @@ def main():
         print(f"\nConfiguration: {config_id}")
         for metric_name, val in metrics.items():
             print(f"  {metric_name:<26}: {val}")
+    print(f"\nNext: python ablation_report.py {args.output}")
 
 
 if __name__ == "__main__":

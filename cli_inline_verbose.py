@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-import sys
-import os
+"""
+Inline shell copilot. Prints ONE gate-validated command on stdout (logs go to stderr).
+
+The command is meant for the user's own shell, so nothing is executed here: the
+orchestrator runs in dry-run mode (generate + static gate), the gate checks paths
+against the real current directory with host symlink resolution, and the printed
+string is exactly the one the gate parsed.
+
+Exit codes: 0 = command printed, 1 = error / invalid model output, 2 = denied or aborted.
+"""
+
+import argparse
 import logging
+import os
+import sys
 
-from schemas import TaskCategory, ActionType
-from static_gate import StaticPolicyGate
-from orchestrator import TermGuardOrchestrator
-from hybrid_retriever import HybridDocRetriever
-from sandbox_runner import SandboxRunner
 from llm_client import QwenClientConfig, QwenStructuredClient
+from orchestrator import TermGuardOrchestrator
+from schemas import DecisionClass, TaskCategory
+from static_gate import StaticPolicyGate
 
-# Configure detailed logging to standard error (so stdout stays clean for the final command)
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)-7s | %(message)s",
@@ -20,145 +29,166 @@ logging.basicConfig(
 logger = logging.getLogger("TermGuard-Verbose")
 
 
-def main():
-    if len(sys.argv) < 2:
-        logger.error(
-            "No prompt provided. Usage: python cli_inline_verbose_2.py <prompt>"
-        )
-        sys.exit(1)
+def host_resolver(paths):
+    return [os.path.realpath(p) for p in paths]
 
-    user_prompt = " ".join(sys.argv[1:]).strip()
-    cwd = os.getcwd()
+
+def ask_user(question: str) -> str:
+    sys.stderr.write(f"\n[TermGuard-Agent] {question}\n> ")
+    sys.stderr.flush()
+    try:
+        return input().strip()
+    except (KeyboardInterrupt, EOFError):
+        sys.stderr.write("\nAborted by user.\n")
+        sys.exit(2)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="TermGuard inline shell copilot")
+    ap.add_argument("prompt", nargs="+")
+    ap.add_argument(
+        "--model",
+        default=os.environ.get("TERMGUARD_MODEL", "qwen2.5-coder:3b-instruct"),
+    )
+    ap.add_argument(
+        "--api-base",
+        default=os.environ.get("TERMGUARD_API_BASE", "http://localhost:11434"),
+    )
+    ap.add_argument(
+        "--corpus",
+        default=None,
+        help="tldr_corpus.json (default: $TERMGUARD_CORPUS, then next to this script)",
+    )
+    ap.add_argument("--no-rag", action="store_true")
+    ap.add_argument(
+        "--prompt-style", choices=["simple", "detailed", "legacy"], default="simple"
+    )
+    ap.add_argument(
+        "--action-format", choices=["commands", "legacy"], default="commands"
+    )
+    ap.add_argument("--strip-duplicated-utility", action="store_true")
+    ap.add_argument(
+        "--max-rounds",
+        type=int,
+        default=3,
+        help="clarification rounds before giving up",
+    )
+    args = ap.parse_args()
+
+    user_prompt = " ".join(args.prompt).strip()
+    cwd = os.path.realpath(os.getcwd())
 
     logger.info("=== 1. INITIALIZATION ===")
-    logger.info(f"Target Directory : {cwd}")
-    logger.info(f"Initial Prompt   : '{user_prompt}'")
+    logger.info(f"Working directory : {cwd}")
+    logger.info(f"Prompt            : '{user_prompt}'")
 
-    gate = StaticPolicyGate()
-    logger.info("Loading Hybrid Retriever and semantic index...")
-    corpus_path = os.path.expanduser(
-        "~/Documents/iiith/sem3/lma/grp_prj/termgaurd_agent/tldr_corpus.json"
+    retriever = None
+    if not args.no_rag:
+        logger.info("Loading hybrid retriever...")
+        from hybrid_retriever import HybridDocRetriever
+
+        try:
+            retriever = HybridDocRetriever(args.corpus, supported_only=True)
+        except FileNotFoundError as exc:
+            logger.warning(f"{exc} Continuing without RAG.")
+
+    client = QwenStructuredClient(
+        QwenClientConfig(
+            model_name_or_path=args.model,
+            backend="ollama",
+            api_base_url=args.api_base,
+            enable_guided_decoding=True,
+            action_format=args.action_format,
+        )
     )
-    retriever = HybridDocRetriever(corpus_path)
-    sandbox = SandboxRunner(image="ubuntu:24.04")
-
-    logger.info("Initializing model via Ollama")
-    client_cfg = QwenClientConfig(
-        # model_name_or_path="termguard-qwen-2.5-3B-coder-ft",
-        model_name_or_path="qwen2.5-coder:3b-instruct",
-        # model_name_or_path="phi4-mini:3.8b",
-        lora_adapter_path=None,
-        backend="ollama",
-        api_base_url="http://localhost:11434",
-        enable_guided_decoding=True,
-    )
-
-    client = QwenStructuredClient(client_cfg)
     orchestrator = TermGuardOrchestrator(
         llm_generate_fn=client.generate,
         retriever=retriever,
-        static_gate=gate,
-        sandbox=sandbox,
+        static_gate=StaticPolicyGate(),
+        sandbox=None,
         config_id="C1",
+        prompt_style=args.prompt_style,
+        strip_duplicated_utility=args.strip_duplicated_utility,
     )
 
     try:
-        while True:
-            logger.info("\n=== 2. ORCHESTRATOR PIPELINE START ===")
+        for round_idx in range(args.max_rounds):
+            logger.info(f"=== 2. PIPELINE (round {round_idx + 1}) ===")
             result = orchestrator.run_episode(
-                task_id="ZSH_INLINE_LOGGED",
+                task_id="CLI_INLINE",
                 category=TaskCategory.BENIGN_ADMIN,
                 task_prompt=user_prompt,
-                allowed_roots=[cwd, "/workspace", "/tmp"],
+                allowed_roots=[cwd],
                 fixture_setup_cmds=[],
+                working_dir=cwd,
+                dry_run=True,
+                path_resolver=host_resolver,
             )
-
-            last_turn = result.turns[-1] if result.turns else None
-            if not last_turn:
-                logger.error("Orchestrator failed to generate a turn.")
-                sys.exit(1)
-
-            logger.info("\n=== 3. RAG RETRIEVAL ===")
-            # Adjusted logging since Hybrid Retriever replaces the explicit utility/coverage log
-            logger.info("Hybrid Semantic RAG context applied.")
-
-            logger.info("\n=== 4. LLM GENERATION ===")
-            sys.stderr.write("-" * 50 + "\n")
-            sys.stderr.write(f"{last_turn.raw_model_output}\n")
+            for t in result.turns:
+                sys.stderr.write(
+                    "-" * 50 + f"\n[attempt {t.attempt_index}] {t.raw_model_output}\n"
+                )
+                if t.gate_verdict:
+                    logger.info(
+                        f"Gate: {t.gate_verdict.final_decision.value} | "
+                        + " ".join(t.gate_verdict.reasons)
+                    )
             sys.stderr.write("-" * 50 + "\n")
 
-            if not last_turn.parsed_action:
-                logger.error("Failed to parse model output into StructuredAction JSON.")
-                sys.exit(1)
+            last = result.turns[-1] if result.turns else None
+            action = last.parsed_action if last else None
+            verdict = last.gate_verdict if last else None
+            logger.info(f"=== 3. OUTCOME: {result.final_status} ===")
 
-            action = last_turn.parsed_action
-            logger.info(f"Parsed Action Type : {action.action_type}")
-            if action.expected_effect:
-                logger.info(f"Expected Effect    : {action.expected_effect}")
-
-            logger.info("\n=== 5. STATIC GATE EVALUATION ===")
-            if last_turn.gate_verdict:
-                logger.info(
-                    f"Final Decision     : {last_turn.gate_verdict.final_decision}"
-                )
-                for idx, reason in enumerate(last_turn.gate_verdict.reasons, 1):
-                    logger.info(f"Reason {idx}           : {reason}")
-            else:
-                logger.warning("No gate verdict was recorded.")
-
-            logger.info("\n=== 6. EXECUTION OUTCOME ===")
-
-            # Handle explicit DENY
-            if result.final_status == "DENIED":
-                logger.error(
-                    "Process halted. Static Policy Gate or Model denied the action."
-                )
-                sys.exit(2)
-
-            # Handle ASK (Disambiguation/Clarification)
-            if result.final_status == "ASKED":
-                logger.warning(
-                    "INTERVENTION REQUIRED: Scope is ambiguous or potentially destructive."
-                )
-
-                question = "Please clarify your request."
-                if action.clarification_question:
-                    question = action.clarification_question
-                elif last_turn.gate_verdict and last_turn.gate_verdict.reasons:
-                    question = last_turn.gate_verdict.reasons[0]
-
-                sys.stderr.write(f"\n[TermGuard-Agent] {question}\n> ")
-                sys.stderr.flush()
-
-                try:
-                    user_reply = input()
-                except (KeyboardInterrupt, EOFError):
-                    sys.stderr.write("\nAborted by user.\n")
-                    sys.exit(1)
-
-                if not user_reply.strip():
-                    logger.error("Empty response. Aborting.")
-                    sys.exit(2)
-
-                user_prompt = f"{user_prompt}\nUser clarification: {user_reply.strip()}"
-                logger.info("Resubmitting task with user clarification...")
-                continue
-
-            # Handle successful EXECUTE
-            if action.action_type == ActionType.EXECUTE:
-                cmd_str = action.to_command_preview()
-                logger.info(f"Command synthesized successfully.")
-
-                print(cmd_str)
+            if result.final_status == "PROPOSED":
+                print(verdict.rendered_command)
                 sys.exit(0)
 
-    except Exception as e:
+            if result.final_status == "DENIED":
+                logger.error("Denied by the static policy gate or the model.")
+                sys.exit(2)
+
+            if result.final_status != "ASKED":
+                logger.error("Could not obtain a valid command from the model.")
+                sys.exit(1)
+
+            # ASKED with a concrete, gate-checked command: confirm it, don't re-generate.
+            if (
+                action
+                and action.commands
+                and verdict
+                and verdict.static_decision != DecisionClass.DENY
+            ):
+                sys.stderr.write(f"\nProposed: {verdict.rendered_command}\n")
+                for r in verdict.reasons:
+                    sys.stderr.write(f"  - {r}\n")
+                if action.clarification_question:
+                    sys.stderr.write(f"  - {action.clarification_question}\n")
+                if ask_user("Run this command? [y/N]").lower() in ("y", "yes"):
+                    print(verdict.rendered_command)
+                    sys.exit(0)
+                logger.info("Not confirmed.")
+                sys.exit(2)
+
+            # ASKED without commands: the model needs disambiguation.
+            question = (
+                action.clarification_question if action else None
+            ) or "Please clarify your request."
+            reply = ask_user(question)
+            if not reply:
+                logger.error("Empty response. Aborting.")
+                sys.exit(2)
+            user_prompt = f"{user_prompt}\nUser clarification: {reply}"
+
+        logger.error(
+            "No executable command after the maximum number of clarification rounds."
+        )
+        sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception:
         logger.exception("A fatal error occurred during pipeline execution.")
         sys.exit(1)
-    finally:
-        logger.info("\n=== 7. CLEANUP ===")
-        sandbox.cleanup()
-        logger.info("Sandbox isolated and dismantled.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,49 @@
+{
+  "input_labels": {
+    "EXECUTE": 93,
+    "ASK": 67,
+    "DENY": 36
+  },
+  "output_labels": {
+    "EXECUTE": 86,
+    "ASK": 32,
+    "ESCALATE": 2,
+    "DENY": 15
+  },
+  "output_total": 135,
+  "train": 129,
+  "val": 6,
+  "dropped": {
+    "gate_deny_contradicts_allow_label": 5,
+    "relabelled_allow_to_ask_by_gate (kept)": 2,
+    "target_invalid_for_current_schema": 3,
+    "refusal_downsampled": 56
+  },
+  "distinct_rationales": 64,
+  "top5_rationale_share": 0.437,
+  "top_rationales": [
+    [
+      "Safe read.",
+      16
+    ],
+    [
+      "Safe diagnostic.",
+      14
+    ],
+    [
+      "Safe find.",
+      10
+    ],
+    [
+      "Safe search.",
+      10
+    ],
+    [
+      "Safe modification.",
+      9
+    ]
+  ],
+  "prompt_style": "simple",
+  "rag": "recorded",
+  "rag_disabled_share": 0.5
+}

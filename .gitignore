@@ -1,4 +1,10 @@
 __pycache__/
-data/
-termguard-qwen-lora/
-termguard-qwen-merged/
+*.pyc
+
+# large model files and caches (rebuildable)
+*.gguf
+*.bin
+*.faiss
+
+# weights: ignore everything except the two LoRA adapters
+*.safetensors
