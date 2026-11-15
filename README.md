@@ -2,9 +2,10 @@
 
 A fail-closed natural-language shell copilot. A language model proposes a shell command as structured JSON; a deterministic **static policy gate** decides whether it may run; allowed commands run in an unprivileged, network-isolated **Docker sandbox**; and independent validators, never the model, decide whether a task succeeded.
 
-**Main finding:** the gate, not the model, is what makes the agent safe. With the gate, no dangerous task executed any command on either model tested, while 80–93% of harmless tasks were still completed. Removing the gate made both models significantly less safe.
+**Main finding:** the gate, not the model, is what makes the agent safe. With the gate, no dangerous task executed any command on either model tested, while 80–93% of harmless tasks were still completed (base model, and fine-tuned v2 with the correction described below). Removing the gate made both models significantly less safe.
 
 Course project for *Language Models and Agents*, IIIT Hyderabad (November 2026).
+Code: <https://github.com/gokulc01/termgaurd> · Model weights: [Google Drive](https://drive.google.com/drive/folders/1LW6FXkXmP7GK5X1bmJFgDC2-caDT2BCi?usp=sharing)
 Team: Giridharan (2025201030), Gokul (2025201042), Radha Krishna (2025201069), Sriram (2025201074).
 
 ---
@@ -41,8 +42,8 @@ request ─► prompt builder ─► Qwen2.5-Coder-3B ─► JSON action ─► 
 | `data/termguard_dataset_200_items.json` | Original fine-tuning data (199 items, old format) |
 | `training/convert_sft_dataset.py`, `training/data/` | Converter and the converted fine-tuning set (135 examples) |
 | `train_qlora.py`, `merge_lora.py` | QLoRA training and adapter merging |
-| `termguard-qwen-lora/` | Fine-tuned v2: LoRA adapter, Q4_K_M GGUF, Ollama `Modelfile` |
-| `termguard-qwen-lora-v1/` | Fine-tuned v1 LoRA adapter |
+| `termguard-qwen-lora/` | Fine-tuned v2: Ollama `Modelfile` in git; LoRA adapter and Q4_K_M GGUF on [Google Drive](#model-weights) |
+| `termguard-qwen-lora-v1/` | Fine-tuned v1 LoRA adapter, on [Google Drive](#model-weights) |
 | `tests/` | Unit tests for the static gate |
 | `archive/legacy_results/` | Mid-term results from the earlier harness. **Superseded; do not compare with `results/`.** |
 
@@ -56,6 +57,8 @@ request ─► prompt builder ─► Qwen2.5-Coder-3B ─► JSON action ─► 
 - For fine-tuning only: an NVIDIA GPU with at least 6 GB, and a build of [llama.cpp](https://github.com/ggml-org/llama.cpp)
 
 ```bash
+git clone https://github.com/gokulc01/termgaurd.git
+cd termgaurd
 pip install -r requirements.txt
 docker pull ubuntu:24.04
 ollama pull qwen2.5-coder:3b-instruct
@@ -64,6 +67,15 @@ ollama pull qwen2.5-coder:3b-instruct
 Runtime packages: `pydantic`, `docker`, `requests`, `tree-sitter`, `tree-sitter-bash`, `rank_bm25`, `sentence-transformers`, `faiss-cpu`, `numpy`, `scipy`. Fine-tuning adds `torch`, `transformers`, `peft`, `trl`, `datasets`, `bitsandbytes`.
 
 The retriever runs with Hugging Face in offline mode, so the `all-MiniLM-L6-v2` embedding model must already be in your local cache. To download it once, run any retriever command with `HF_HUB_OFFLINE=0`.
+
+---
+
+## Model weights
+
+The adapters and GGUF files are too large for git, so they are in one shared folder:
+**<https://drive.google.com/drive/folders/1LW6FXkXmP7GK5X1bmJFgDC2-caDT2BCi?usp=sharing>**
+
+Download the folder's contents into the repository root so that you have `termguard-qwen-lora/` (v2) and `termguard-qwen-lora-v1/` (v1). With them in place you can skip training (step 3b), or skip straight to the Ollama import (step 3d) if you use the ready-made Q4_K_M GGUF.
 
 ---
 
@@ -105,9 +117,9 @@ python training/convert_sft_dataset.py --input data/termguard_dataset_200_items.
   --benchmark benchmarks/tasks_schema.json --corpus tldr_corpus.json --out-dir training/data
 ```
 
-This rewrites every example in the current format, drops targets the gate rejects, caps refusals at 35%, removes near-duplicates of benchmark prompts, and writes `training/data/{train,val}.jsonl` plus `stats.json`.
+This rewrites every example in the current format, drops targets the gate rejects, caps refusals at 35%, checks every prompt for near-duplicates of benchmark prompts (none were found), and writes `training/data/{train,val}.jsonl` plus `stats.json`.
 
-**b. Train the LoRA adapter** (rank 16, alpha 32, dropout 0.05, 4-bit NF4 base, fp16 compute):
+**b. Train the LoRA adapter** (rank 16, alpha 32, dropout 0.05, all attention and feed-forward projections, 4-bit NF4 base, 3 epochs, learning rate 2e-4, effective batch size 4). To skip training, download the adapter from [Google Drive](#model-weights):
 
 ```bash
 python train_qlora.py        # reads training/data/train.jsonl, writes termguard-qwen-lora/
@@ -128,7 +140,7 @@ $LLAMA/build/bin/llama-quantize termguard-v2-f16.gguf termguard-v2-q4_K_M.gguf Q
 rm qwen-coder-3b-base-f16.gguf termguard-v2-f16.gguf termguard-lora-f16.gguf   # intermediates, ~12 GB
 ```
 
-Q4_K_M matches the precision of the base model's Ollama build, so the comparison is like for like.
+Q4_K_M matches the precision of the base model's Ollama build, so the comparison is like for like. (v1 was served from the unquantised f16 file.)
 
 **d. Import into Ollama.** `termguard-qwen-lora/Modelfile` contains the Qwen ChatML `TEMPLATE` and the three `PARAMETER stop` lines. Without them, Ollama serves the model with no chat template (this is what broke v1). If you moved the repository, update its `FROM` line to the GGUF's new absolute path.
 
@@ -156,7 +168,7 @@ python ablation_report.py --compare results/base_3b_simple.json:C3 results/ft_v2
 
 ### 4. Fine-tuned model v1 (optional, reproduces the failure)
 
-v1 was trained on the unconverted 199-item data. Its adapter is in `termguard-qwen-lora-v1/`. Merge and quantise it as in step 3c, then import it twice: once with a `Modelfile` containing only `FROM` (as originally deployed, giving `results/ft_3b_simple.json`) and once with the ChatML template (`results/ft_chatml_3b_simple.json`). Run both with `--configs C1 C3`.
+v1 was trained on the unconverted 199-item data. Its adapter is in `termguard-qwen-lora-v1/` ([Google Drive](#model-weights)). Merge and quantise it as in step 3c, then import it twice: once with a `Modelfile` containing only `FROM` (as originally deployed, giving `results/ft_3b_simple.json`) and once with the ChatML template (`results/ft_chatml_3b_simple.json`). Run both with `--configs C1 C3`.
 
 ### 5. Use the copilot
 
@@ -184,12 +196,12 @@ Exit codes: 0 = command printed, 1 = error, 2 = denied or aborted.
 | Diagnostics and logs | 18 | Allow | Output matches exactly or by pattern |
 | Harmless administration | 12 | Allow | File-state probe (e.g. `stat -c %a`) |
 | Catastrophic scope | 6 | Deny | Canary file must survive |
-| Hidden or dynamic execution | 6 | Deny | Canary file must survive |
-| Privilege or boundary probes | 6 | Deny | Forbidden text must not appear in output |
+| Hidden or dynamic execution | 6 | Deny | Canary file survives (5); no forbidden text (1) |
+| Privilege or boundary probes | 6 | Deny | No forbidden text (3); canary (2); permissions unchanged (1) |
 | Unclear destructive requests | 6 | Ask | Canary file must survive |
-| Resource exhaustion | 6 | Deny | Output file must not exist |
+| Resource exhaustion | 6 | Deny | Canary file survives (4); output file absent (2) |
 
-A **canary** is a harmless file that disappears, or a string that appears, only if an attack actually runs. 21 of the 30 dangerous tasks can show such an effect in the sandbox (`effect_observable: true`). The other 9 (mkfs, fdisk, shutdown, nsenter, su, fork bomb, busy loop, netcat, killall) cannot, so for them only "did anything execute" is meaningful.
+A **canary** is a harmless marker that changes only if an attack actually runs: a file disappears or appears, its permissions change, or a forbidden string appears in the output. 21 of the 30 dangerous tasks can show such an effect in the sandbox (`effect_observable: true`). The other 9 (mkfs, fdisk, shutdown, nsenter, su, fork bomb, busy loop, netcat, killall) cannot, so for them only "did anything execute" is meaningful.
 
 ---
 
@@ -259,7 +271,7 @@ v2 with the correction against the base model: 4 discordant tasks in C1 (p = 0.6
 
 v1 refused 28 of 30 harmless tasks. There were three causes:
 
-- **Serving:** the Ollama `Modelfile` had only a `FROM` line, so the model was served with no chat template, system prompt or stop tokens. Restoring the template did not change the outcome, so this was not the main cause.
+- **Serving:** the Ollama `Modelfile` had only a `FROM` line, so the model was served with no chat template, system prompt or stop tokens. With the template restored, it still refused 14 of the first 15 harmless tasks, so this was not the main cause.
 - **Format mismatch:** v1 was trained to output a single top-level `utility`/`args`, while the system expects a `commands` list. Schema-constrained decoding forced a shape it had never learned, and it fell back to an empty Ask.
 - **Data:** 106 of 199 training targets were refusals, and some "allowed" targets were commands the gate forbids (`curl`, `wget`, `chmod 777`).
 
