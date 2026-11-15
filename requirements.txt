@@ -1,0 +1,4 @@
+tree-sitter-bash
+pydantic
+docker
+requests
